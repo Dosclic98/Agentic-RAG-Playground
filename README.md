@@ -1,11 +1,104 @@
 # Agentic-RAG-Playground
 
 A terminal question-answering agent for local PDFs, using Ollama and keyword retrieval.
-Place PDFs in `data/pdfs/`, start Ollama with the configured model available, and run:
+
+## Setup (Linux / Bash)
+
+Start from a checkout of this repository. You need Python with `pip` and `venv`
+support; the project has been tested with Python 3.9.25. For NVIDIA GPU inference,
+the NVIDIA driver must also be installed; `nvidia-smi` should show your GPU.
+Package installation, model downloads, and OCR language downloads require internet access.
+
+### 1. Create and activate the virtual environment
+
+Run these commands from the project directory, adjusting the path if needed:
 
 ```bash
-python3 main.py
+cd ~/Agentic-RAG-Playground
+python3 -m venv .venv
+source .venv/bin/activate
 ```
+
+Create `.venv` once. In each new terminal, run `source .venv/bin/activate` from
+the project directory again. The following `python` commands use that environment.
+
+### 2. Install the Python dependencies
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+`pip check` should report no broken requirements. If an existing environment has
+dependency conflicts, update the dependencies together and check again:
+
+```bash
+python -m pip install --upgrade -r requirements.txt
+python -m pip check
+```
+
+### 3. Install Ollama and download the model
+
+Ollama runs as a separate server. The Python `ollama` dependency is its client;
+install the server using the [official Linux installation instructions](https://docs.ollama.com/linux)
+if it is not already available:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+If Ollama is not already running as a service, start it in a second terminal and
+leave that terminal open:
+
+```bash
+ollama serve
+```
+
+Back in the project terminal, download the model configured in `code/config.py`
+and check the available models:
+
+```bash
+ollama pull qwen3.8:27b-q8_0
+ollama ls
+```
+
+The default is the [Qwen3.8 27B Q8_0 model](https://ollama.com/library/qwen3.8:27b-q8_0).
+To use another model, download its tag and set `AgentConfig.model` to that exact
+tag in `code/config.py`. It must support tool calling and thinking, which the
+agent requests. The default server address is `http://127.0.0.1:11434`;
+edit `AgentConfig.host` if your server uses a different address.
+See the [Ollama CLI reference](https://docs.ollama.com/cli) for server and model commands.
+
+### 4. Add PDFs and optional OCR language data
+
+```bash
+mkdir -p data/pdfs
+```
+
+Copy your PDFs into `data/pdfs/`; subdirectories are supported. For scanned PDFs,
+also install the English and Italian OCR language data:
+
+```bash
+python scripts/setup_ocr.py
+```
+
+Text-based PDFs work without this OCR setup. Additional languages and OCR settings
+are described below.
+
+### 5. Start the chat
+
+With `.venv` activated and Ollama running, launch the agent from the project root:
+
+```bash
+python main.py
+```
+
+For example, ask: `Summarize the main results in the PDFs and cite the relevant pages.`
+When finished, exit the chat with `/exit`, then run `deactivate` to leave the virtual
+environment. A manually started `ollama serve` can be stopped with Ctrl+C in its terminal.
+
+## Terminal usage
 
 Use `/clear` to reset the conversation, `/exit` to quit, or Ctrl+C to interrupt.
 Use `/verbose` to toggle tool arguments and generation statistics; `/verbose on`
@@ -78,17 +171,16 @@ means the searched content may be incomplete. Company and year filters inspect
 filenames, so omit them when searching for mentions inside other companies' PDFs.
 Index scores rank passages; they do not count every mention of a subject.
 
-Install the PDF dependency and English/Italian OCR data with:
+The optional OCR setup from the installation steps downloads English/Italian data:
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 scripts/setup_ocr.py
+python scripts/setup_ocr.py
 ```
 
 OCR uses PyMuPDF's integrated Tesseract support and local language files;
 no environment variables are required. The setup script downloads files from
 [Tesseract's official tessdata_fast repository](https://github.com/tesseract-ocr/tessdata_fast).
-For additional languages, run `python3 scripts/setup_ocr.py --languages deu`, for
+For additional languages, run `python scripts/setup_ocr.py --languages deu`, for
 example. Set `ocr_data_path` in `code/config.py` if you use a different folder inside
 the project, and pass the same folder to the setup script with `--directory`.
 See [PyMuPDF's OCR setup documentation](https://pymupdf.readthedocs.io/en/latest/installation.html#enabling-integrated-ocr-support).
@@ -99,11 +191,11 @@ Recognized text does not reconstruct scanned table geometry. The original PDFs
 are never modified; the index and downloaded language files are ignored by Git.
 Removing `.rag_cache/` resets the index and cached OCR text.
 
-Install the test dependencies and run the checks with:
+For development, activate `.venv`, install the test dependencies, and run the checks:
 
 ```bash
-python3 -m pip install -r requirements-dev.txt
-python3 -m unittest discover -s tests -v
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
 ```
 
 The terminal tests use `pyte` to check scrollback, table rows, and cursor restoration.
