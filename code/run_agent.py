@@ -6,14 +6,14 @@ from ollama import Client, Message, ResponseError
 if __package__:
     from .config import AgentConfig
     from .conversation import Conversation
-    from .prompts import SYSTEM_PROMPT
-    from .tools import PDFTools
+    from .prompts import SYSTEM_PROMPT, build_system_prompt
+    from .tools import PDFTools, WebTools
     from .terminal_output import TerminalOutput
 else:
     from config import AgentConfig
     from conversation import Conversation
-    from prompts import SYSTEM_PROMPT
-    from tools import PDFTools
+    from prompts import SYSTEM_PROMPT, build_system_prompt
+    from tools import PDFTools, WebTools
     from terminal_output import TerminalOutput
 
 
@@ -27,12 +27,20 @@ class PDFChatAgent:
             pdf_tools if pdf_tools is not None else PDFTools(
                 self.config.project_root, ocr_data_path=self.config.ocr_data_path)
         )
-        self.tools = self.pdf_tools.registry
+        self.tools = dict(self.pdf_tools.registry)
+        self.web_tools = None
+        if self.config.web_enabled:
+            self.web_tools = WebTools(
+                self.config.project_root, self.config.web_credentials_path,
+                self.config.web_timeout_seconds)
+            self.web_tools.check_configuration()
+            self.tools.update(self.web_tools.registry)
         self.output_factory = output_factory if output_factory is not None else lambda: TerminalOutput(
             width=self.config.output_width, verbose=self.config.verbose)
         self._output = None
         self.conversation = Conversation(
-            SYSTEM_PROMPT, self.config.context_length, self.config.max_output_tokens)
+            build_system_prompt(self.config.web_enabled),
+            self.config.context_length, self.config.max_output_tokens)
 
     def _get_output(self):
         if self._output is None:
@@ -143,6 +151,7 @@ class PDFChatAgent:
         output.status(f"Model: {self.config.model}")
         output.status(f"Context window: {self.config.context_length:,} tokens")
         output.status(f"Project: {self.pdf_tools.root}")
+        output.status(f"Web access: {'on (Tavily)' if self.web_tools else 'off'}")
         output.status("Commands: /exit to quit, /clear to reset, /verbose to toggle tool details.")
 
         while True:

@@ -37,6 +37,20 @@ class CitationTests(unittest.TestCase):
         self.assertEqual(formatter.format("Claim [data/pdfs/Report, annual 2022.PDF, pp. 1, 3]."), "Claim [1].")
         self.assertEqual(list(formatter.sources), [("data/pdfs/Report, annual 2022.PDF", "pp. 1, 3")])
 
+    def test_web_and_pdf_citations_are_numbered_in_appearance_order(self):
+        formatter = CitationFormatter()
+        text = ("External [https://example.com/report?year=2026]. "
+                "PDF [data/pdfs/report.pdf, p. 12]. Again [https://example.com/report?year=2026].")
+        self.assertEqual(formatter.format(text), "External [1]. PDF [2]. Again [1].")
+        self.assertEqual(list(formatter.sources), [("https://example.com/report?year=2026", "web"),
+                                                 ("data/pdfs/report.pdf", "p. 12")])
+
+    def test_web_citations_in_code_and_incomplete_urls_are_preserved(self):
+        formatter = CitationFormatter()
+        text = "`[https://example.com/report]`\n\n```text\n[https://example.com/report]\n```\n\n[https://example.com/unfinished"
+        self.assertEqual(formatter.format(text), text)
+        self.assertFalse(formatter.sources)
+
 
 if __name__ == "__main__":
     unittest.main()

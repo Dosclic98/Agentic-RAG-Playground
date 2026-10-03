@@ -207,6 +207,16 @@ class TerminalOutputTests(unittest.TestCase):
         self.assertIn("Sources", rendered)
         self.assertEqual(rendered.count("data/pdfs/report.pdf, p. 12"), 1)
 
+    def test_web_sources_are_visible_and_distinct_from_pdf_sources(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        output.answer("Document [data/pdfs/report.pdf, p. 12]. External [https://example.com/report].")
+        output.finish()
+        rendered, _ = self.screen_text(stream.getvalue())
+        self.assertIn("Document [1]. External [2].", rendered)
+        self.assertIn("[1] data/pdfs/report.pdf, p. 12", rendered)
+        self.assertIn("[2] Web: https://example.com/report", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -41,7 +41,9 @@ class Conversation:
             items = [Conversation._shorten(item, text_bytes, list_limit) for item in value[:list_limit]]
             return [item for item, _ in items], len(value) > list_limit or any(cut for _, cut in items)
         if isinstance(value, dict):
-            items = {key: Conversation._shorten(item, text_bytes, list_limit) for key, item in value.items()}
+            items = {key: (item, False) if key in ("url", "requested_url") and isinstance(item, str)
+                     else Conversation._shorten(item, text_bytes, list_limit)
+                     for key, item in value.items()}
             result = {key: item for key, (item, _) in items.items()}
             changed = any(cut for _, cut in items.values())
             if changed:
@@ -50,6 +52,9 @@ class Conversation:
                 result["truncated"] = True
                 if "page" in value and "offset" in value:
                     result["next"] = {"page": value["page"],
+                                      "offset": value["offset"] + len(result["text"])}
+                elif value.get("source_type") == "web" and "offset" in value and "url" in value:
+                    result["next"] = {"url": value.get("requested_url", value["url"]),
                                       "offset": value["offset"] + len(result["text"])}
             return result, changed
         return value, False

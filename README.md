@@ -1,6 +1,7 @@
 # Agentic-RAG-Playground
 
-A terminal question-answering agent for local PDFs, using Ollama and keyword retrieval.
+A terminal question-answering agent for local PDFs, using Ollama and keyword retrieval,
+with optional web search for external context.
 
 ## Setup (Linux / Bash)
 
@@ -117,6 +118,62 @@ source list under each response. The model's saved conversation retains its full
 inline citations. Redirected output keeps raw Markdown and full citations, without
 terminal colors or live redraw controls.
 
+## Optional web retrieval
+
+Web access defaults to **off**. To enable it, get a [Tavily API key](https://app.tavily.com)
+and create the local credentials file from the supplied example:
+
+```bash
+cp .web_credentials.example.json .web_credentials.json
+chmod 600 .web_credentials.json
+```
+
+Edit `.web_credentials.json` to set your key:
+
+```json
+{
+  "tavily_api_key": "your-tavily-api-key"
+}
+```
+
+The local credentials file is ignored by Git. Set `web_enabled=True` in
+`code/config.py`, then restart `python main.py`. No environment variables or
+additional Python packages are needed. Enabled mode checks credentials before
+starting the chat. It adds exactly two tools:
+
+| Tool | Behavior |
+| --- | --- |
+| `web_search(query, max_results=5)` | Return up to 10 public source URLs, titles, publication dates when available, and excerpts of up to 2,000 characters per result. |
+| `read_web_page(url, offset=0, max_chars=6000)` | Extract page text through Tavily, with up to 12,000 characters per call. Follow the returned `next` cursor to read further text. |
+
+The agent searches PDFs first for document questions. Web sources can supplement
+broader questions or provide current information; requests restricted to the PDFs
+remain scoped to those PDFs. The prompt tells the model to verify web claims by
+reading the pages, prefer original sources, preserve reporting dates, and label
+external context. Page extraction can fail, and publication dates can be unknown.
+
+Web claims use `[https://the-returned-page-url]` in saved messages and redirected
+output. Interactive output gives them compact citation numbers alongside PDF
+citations, with `Web:` labels and full URLs in the source list.
+
+Search queries and requested page URLs are sent to Tavily and use your account's
+quota. The tools do not upload PDF files; the model is instructed to exclude private
+PDF passages and credentials from search queries. Extracted pages are cached in
+memory for 15 minutes, up to eight pages, so pagination reuses one extraction.
+Network calls use `web_timeout_seconds` (25 seconds by default). Set
+`web_credentials_path` to change the credentials file location inside the project;
+keep any custom credentials file out of Git as well.
+See the [search](https://docs.tavily.com/documentation/api-reference/endpoint/search)
+and [page extraction](https://docs.tavily.com/documentation/api-reference/endpoint/extract)
+API documentation.
+
+Tool descriptions consume context and can increase model processing and selection
+time. With web access disabled, neither these tool definitions nor their extra
+instructions are sent to the model. When enabled, bounded results and cached page
+reads reduce repeated network work and keep evidence sizes manageable.
+
+## Code and configuration
+
 The code is organized by responsibility:
 
 | Class | File | Responsibility |
@@ -125,13 +182,14 @@ The code is organized by responsibility:
 | `PDFChatAgent` | `code/run_agent.py` | Streaming, tool dispatch, compatibility retries, and the terminal loop. |
 | `Conversation` | `code/conversation.py` | Chat history, resets, failure recovery, and evidence compaction. |
 | `PDFTools` | `code/tools/tool_defs.py` | PDF discovery, search, reading, metadata, tables, OCR, and calculations. |
+| `WebTools` | `code/tools/web_tools.py` | Optional public web search, page extraction, and an in-memory page cache. |
 | `CollectionIndex` | `code/tools/collection_index.py` | Persistent keyword index and recognized page text. |
 | `Calculator` | `code/tools/calculator.py` | Restricted arithmetic with decimal precision. |
 | `TerminalOutput` | `code/terminal_output.py` | Streamed answers and transient thinking display. |
-| `CitationFormatter` | `code/citations.py` | Compact display references with complete source details. |
+| `CitationFormatter` | `code/citations.py` | Compact PDF and web references with complete source details. |
 
 Edit the defaults in `code/config.py` to change model settings. The default model
-is `qwen3.8:27b-q8_0`, with a 65,536-token context and an 8,192-token output limit.
+is `qwen3.8:27b-q8_0`, with a 131,072-token context and a 16,384-token output limit.
 The PDF question-answering instructions live in `code/prompts.py`.
 Set `output_width` to change the maximum rendered width (100 columns by default),
 or set `verbose=True` to start with detailed logs. Rendering also fits the terminal's
@@ -143,7 +201,7 @@ For use from Python, create an agent with its own configuration and conversation
 from code.config import AgentConfig
 from code.run_agent import PDFChatAgent
 
-agent = PDFChatAgent(AgentConfig(context_length=65536))
+agent = PDFChatAgent(AgentConfig(context_length=131072))
 agent.run()
 ```
 

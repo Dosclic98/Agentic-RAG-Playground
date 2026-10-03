@@ -222,3 +222,6 @@ __marimo__/
 # Local PDF retrieval cache and downloaded OCR language data
 .rag_cache/
 data/tessdata/*.traineddata
+
+# Optional web search credentials
+.web_credentials.json

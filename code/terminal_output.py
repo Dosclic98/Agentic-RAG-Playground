@@ -173,7 +173,8 @@ class TerminalOutput:
                 if self._citations.sources:
                     self.console.print(Text("\nSources", style="bold grey63"))
                     for (path, pages), number in self._citations.sources.items():
-                        self.console.print(Text(f"[{number}] {path}, {pages}", style="grey63"))
+                        label = f"Web: {path}" if pages == "web" else f"{path}, {pages}"
+                        self.console.print(Text(f"[{number}] {label}", style="grey63"))
                 self.console.print()
             else:
                 self.stream.write("\n")
@@ -230,5 +231,7 @@ class TerminalOutput:
             "extract_pdf_tables": f"Extracting tables from {filename}, {pages}…",
             "ocr_pdf_pages": f"Recognizing text in {filename}, {pages}…",
             "calculate": "Calculating…",
+            "web_search": "Searching the web…",
+            "read_web_page": "Reading a web page…",
         }
         self.status(descriptions.get(name, f"Running {name.replace('_', ' ')}…"))

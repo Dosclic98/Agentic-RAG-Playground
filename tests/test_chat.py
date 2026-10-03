@@ -17,7 +17,7 @@ import run_agent as chat
 class ChatTests(unittest.TestCase):
     def setUp(self):
         self.agent = chat.PDFChatAgent(
-            config=chat.AgentConfig(context_length=16384), client=Mock())
+            config=chat.AgentConfig(context_length=16384, max_output_tokens=8192), client=Mock())
         self.history = [{"role": "system", "content": chat.SYSTEM_PROMPT},
                         {"role": "user", "content": "Find Adobe annual reports."},
                         {"role": "assistant", "tool_calls": []},
@@ -185,6 +185,70 @@ class ChatTests(unittest.TestCase):
         original = record.copy()
         chat.Conversation._compact_record(record)
         self.assertEqual(record, original)
+
+    def test_web_disabled_sends_no_web_schemas_or_instructions_and_reads_no_credentials(self):
+        with patch.object(chat.WebTools, "check_configuration", side_effect=AssertionError("unused")):
+            agent = chat.PDFChatAgent(client=Mock())
+        self.assertIsNone(agent.web_tools)
+        self.assertEqual(agent.conversation.messages[0]["content"], chat.SYSTEM_PROMPT)
+        self.assertNotIn("web_search", agent.tools)
+        client = Mock(chat=Mock(return_value=iter([ChatResponse(
+            message=Message(role="assistant", content="Hello."), done=True)])))
+        agent.client = client
+        with redirect_stdout(io.StringIO()):
+            agent._stream_response([{"role": "user", "content": "Hello"}])
+        self.assertNotIn("web_search", [tool.__name__ for tool in client.chat.call_args.kwargs["tools"]])
+
+    def test_enabled_web_tools_search_read_and_answer_with_saved_url_citations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".web_credentials.json").write_text('{"tavily_api_key": "test-key"}')
+            config = chat.AgentConfig(project_root=root, web_enabled=True)
+            url = "https://example.com/announcement"
+            calls = [Message.ToolCall(function=Message.ToolCall.Function(
+                name="web_search", arguments={"query": "public announcement"})),
+                Message.ToolCall(function=Message.ToolCall.Function(name="read_web_page", arguments={"url": url}))]
+            content = f"External context: the announcement is published. [{url}]"
+            client = Mock(chat=Mock(side_effect=[
+                iter([ChatResponse(message=Message(role="assistant", tool_calls=[call]), done=True)])
+                for call in calls] + [iter([ChatResponse(message=Message(role="assistant", content=content), done=True)])]))
+            agent = chat.PDFChatAgent(config=config, client=client)
+            agent.conversation.add_user("Find the latest public announcement.")
+            with patch.object(agent.web_tools, "_post", side_effect=[
+                {"results": [{"title": "Announcement", "url": url, "content": "A useful lead."}]},
+                {"results": [{"url": url, "raw_content": "The official announcement."}]}]), redirect_stdout(io.StringIO()):
+                agent.answer()
+            evidence = [json.loads(message["content"]) for message in agent.conversation.messages
+                        if isinstance(message, dict) and message["role"] == "tool"]
+            self.assertEqual(evidence[0]["source_type"], "web")
+            self.assertEqual(evidence[1]["text"], "The official announcement.")
+            self.assertEqual(agent.conversation.messages[-1].content, content)
+            self.assertIn("Optional web retrieval is enabled", agent.conversation.messages[0]["content"])
+            self.assertEqual(len(agent.tools), len(agent.pdf_tools.registry) + 2)
+            from ollama._utils import convert_function_to_tool
+            schemas = [convert_function_to_tool(tool).model_dump() for tool in agent.web_tools.registry.values()]
+            self.assertEqual(schemas[0]["function"]["parameters"]["required"], ["query"])
+            self.assertEqual(schemas[1]["function"]["parameters"]["required"], ["url"])
+            self.assertNotIn("test-key", json.dumps(schemas))
+
+    def test_enabled_web_without_credentials_fails_before_model_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = Mock()
+            with self.assertRaisesRegex(ValueError, "tavily_api_key"):
+                chat.PDFChatAgent(config=chat.AgentConfig(project_root=Path(directory), web_enabled=True), client=client)
+            client.chat.assert_not_called()
+
+    def test_compacted_web_page_preserves_url_and_resumes_after_visible_characters(self):
+        url = "https://example.com/report?query=" + "x" * 1500
+        evidence = {"source_type": "web", "url": url, "requested_url": url,
+                    "offset": 100, "text": "é" * 12000, "next": None}
+        record = {"role": "tool", "tool_name": "read_web_page", "content": json.dumps(evidence)}
+        shortened = json.loads(chat.Conversation._compact_record(record)["content"])
+        self.assertEqual(shortened["url"], url)
+        self.assertEqual(shortened["requested_url"], url)
+        self.assertEqual(shortened["next"], {"url": url, "offset": 100 + len(shortened["text"])})
+        self.assertTrue(shortened["truncated"])
+        self.assertEqual(json.loads(record["content"]), evidence)
 
     def test_compacted_collection_search_cursor_keeps_omitted_passages_accessible(self):
         evidence = {"offset": 10, "next_offset": None, "has_more": False,

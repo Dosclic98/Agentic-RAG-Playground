@@ -10,9 +10,12 @@ class AgentConfig:
 
     model: str = "qwen3.8:27b-q8_0"
     host: str = "http://127.0.0.1:11434"
-    context_length: int = 65536
-    max_output_tokens: int = 8192
+    context_length: int = 131072
+    max_output_tokens: int = 16384
     project_root: Path = Path(__file__).resolve().parents[1]
     ocr_data_path: str = "data/tessdata"
     output_width: int = 100
     verbose: bool = False
+    web_enabled: bool = False
+    web_credentials_path: str = ".web_credentials.json"
+    web_timeout_seconds: int = 25

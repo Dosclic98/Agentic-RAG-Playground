@@ -1,4 +1,4 @@
-"""Compact full PDF citations for display while preserving their source details."""
+"""Compact PDF and web citations for display while preserving source details."""
 
 import re
 
@@ -8,7 +8,8 @@ from markdown_it import MarkdownIt
 class CitationFormatter:
     PATTERN = re.compile(
         r"\[(?P<path>[^\]\n]+?\.pdf)\s*,\s*"
-        r"(?P<pages>pp?\.\s*\d+(?:\s*(?:[-–,]|and)\s*\d+)*)\]",
+        r"(?P<pages>pp?\.\s*\d+(?:\s*(?:[-–,]|and)\s*\d+)*)\]"
+        r"|\[(?P<url>https?://[^\]\s<>]+)\]",
         re.IGNORECASE,
     )
     INLINE_CODE = re.compile(r"(`+).*?\1", re.DOTALL)
@@ -19,9 +20,12 @@ class CitationFormatter:
 
     def _replace(self, text):
         def reference(match):
-            path = match.group("path").strip()
-            pages = re.sub(r"\s+", " ", match.group("pages").strip())
-            pages = re.sub(r"^pp?\.\s*", lambda label: label.group().strip().lower() + " ", pages)
+            if match.group("url") is not None:
+                path, pages = match.group("url"), "web"
+            else:
+                path = match.group("path").strip()
+                pages = re.sub(r"\s+", " ", match.group("pages").strip())
+                pages = re.sub(r"^pp?\.\s*", lambda label: label.group().strip().lower() + " ", pages)
             source = (path, pages)
             if source not in self.sources:
                 self.sources[source] = len(self.sources) + 1
