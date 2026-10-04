@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -8,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from ollama import ChatResponse, Message, ResponseError
 from pypdf import PdfWriter
+import pyte
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
@@ -115,7 +117,7 @@ class ChatTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(self.agent.conversation, "messages", self.history), patch.object(self.agent, "client", Mock(chat=Mock(return_value=iter([response])))), redirect_stdout(output):
             self.agent.answer()
-        self.assertNotIn("Generation ended: length", output.getvalue())
+        self.assertNotIn("Final model call ended: length", output.getvalue())
         self.assertIn("generation limit", output.getvalue())
         self.assertEqual(self.history[-1].content, message.content)
 
@@ -138,7 +140,7 @@ class ChatTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             agent.answer()
-        self.assertIn("Generation ended: stop; generated tokens: 20", output.getvalue())
+        self.assertIn("Final model call ended: stop; generated tokens: 20", output.getvalue())
 
     def test_tool_failures_remain_visible_in_quiet_mode(self):
         call = Message.ToolCall(function=Message.ToolCall.Function(name="unknown", arguments={}))
@@ -359,6 +361,161 @@ class ChatTests(unittest.TestCase):
         with patch.object(self.agent, "_stream_response", side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()):
             with self.assertRaises(KeyboardInterrupt):
                 self.agent.answer()
+
+    @staticmethod
+    def renderer_mock(include_hooks=True):
+        methods = ["status", "debug", "warning", "error", "tool", "thinking",
+                   "answer", "clear_thinking", "finish", "prompt", "toggle_verbose"]
+        if include_hooks:
+            methods += ["startup", "begin_turn", "activity", "end_turn"]
+        return Mock(spec=methods)
+
+    def test_startup_hook_receives_settings_without_duplicate_status_lines(self):
+        output = self.renderer_mock()
+        output.prompt.return_value = "/exit"
+        with patch.object(self.agent, "output_factory", return_value=output):
+            self.agent.run()
+        output.startup.assert_called_once_with(
+            self.agent.config.model, self.agent.config.context_length,
+            self.agent.pdf_tools.root, False)
+        output.status.assert_not_called()
+
+    def test_legacy_renderer_keeps_startup_and_answer_without_optional_hooks(self):
+        output = self.renderer_mock(include_hooks=False)
+        output.prompt.return_value = "/exit"
+        response = ChatResponse(message=Message(role="assistant", content="Answer."),
+                                done=True, eval_count=10)
+        client = Mock(chat=Mock(return_value=iter([response])))
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client):
+            self.agent.run()
+            self.agent.answer()
+        self.assertEqual(output.status.call_count, 5)
+        self.assertIn("Context window: 16,384", output.status.call_args_list[1].args[0])
+        output.answer.assert_called_once_with("Answer.")
+        output.finish.assert_called_once()
+
+    def test_turn_hooks_span_all_tool_rounds_and_sum_actual_generation_counts(self):
+        output = self.renderer_mock()
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
+        replies = [ChatResponse(message=Message(role="assistant", tool_calls=[call]), done=True, eval_count=12),
+                   ChatResponse(message=Message(role="assistant", content="Answer."), done=True, eval_count=30)]
+        client = Mock(chat=Mock(side_effect=[iter([reply]) for reply in replies]))
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client), patch.object(self.agent, "tools", {"lookup": Mock(return_value='{"text": "evidence"}')}):
+            self.agent.answer()
+        output.begin_turn.assert_called_once_with()
+        output.end_turn.assert_called_once_with(generated_tokens=42)
+        output.debug.assert_called_once_with(
+            "[Chat] Final model call ended: unknown; generated tokens: 30.")
+        self.assertEqual([entry.args[0] for entry in output.activity.call_args_list],
+                         ["Waiting for the model…", "Waiting for the model…"])
+        self.assertEqual(output.finish.call_count, 3)
+        self.assertEqual(output.method_calls[0][0], "begin_turn")
+        self.assertEqual(output.method_calls[-1][0], "end_turn")
+
+    def test_turn_footer_omits_unknown_counts_and_preserves_measured_zero(self):
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
+        for first_count, final_count, expected in [(None, 30, None), (12, None, None), (0, 0, 0)]:
+            with self.subTest(first=first_count, final=final_count):
+                output = self.renderer_mock()
+                replies = [ChatResponse(message=Message(role="assistant", tool_calls=[call]), done=True, eval_count=first_count),
+                           ChatResponse(message=Message(role="assistant", content="Answer."), done=True, eval_count=final_count)]
+                client = Mock(chat=Mock(side_effect=[iter([reply]) for reply in replies]))
+                agent = chat.PDFChatAgent(client=client, output_factory=lambda: output)
+                agent.tools = {"lookup": Mock(return_value='{"text": "evidence"}')}
+                agent.conversation.add_user("Find evidence.")
+                agent.answer()
+                output.end_turn.assert_called_once_with(generated_tokens=expected)
+
+    def test_initial_client_failure_finishes_display_and_turn(self):
+        output = self.renderer_mock()
+        client = Mock(chat=Mock(side_effect=RuntimeError("offline")))
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                self.agent.answer()
+        output.activity.assert_called_once_with("Waiting for the model…")
+        output.finish.assert_called_once_with()
+        output.begin_turn.assert_called_once_with()
+        output.end_turn.assert_called_once_with(generated_tokens=None)
+
+    def test_interrupted_later_stream_closes_resources_and_turn_without_partial_totals(self):
+        output = self.renderer_mock()
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
+        first = ChatResponse(message=Message(role="assistant", tool_calls=[call]), done=True, eval_count=12)
+
+        class InterruptedStream:
+            close = Mock()
+
+            def __iter__(self):
+                yield ChatResponse(message=Message(role="assistant", thinking="Partial thought"))
+                raise KeyboardInterrupt
+
+        stream = InterruptedStream()
+        client = Mock(chat=Mock(side_effect=[iter([first]), stream]))
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client), patch.object(self.agent, "tools", {"lookup": Mock(return_value='{"text": "evidence"}')}):
+            with self.assertRaises(KeyboardInterrupt):
+                self.agent.answer()
+        stream.close.assert_called_once_with()
+        self.assertEqual(output.finish.call_count, 3)
+        output.begin_turn.assert_called_once_with()
+        output.end_turn.assert_called_once_with(generated_tokens=None)
+
+    def test_tool_completion_errors_and_interrupts_always_finish_activity(self):
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
+        evidence = '{"text": "evidence"}'
+        for exception in (None, ValueError("tool failed"), KeyboardInterrupt()):
+            with self.subTest(exception=type(exception).__name__):
+                output = self.renderer_mock()
+                agent = chat.PDFChatAgent(client=Mock(), output_factory=lambda: output)
+                agent.tools = {"lookup": Mock(return_value=evidence, side_effect=exception)}
+                if isinstance(exception, KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        agent._execute_tool(call)
+                    self.assertEqual(len(agent.conversation.messages), 1)
+                else:
+                    agent._execute_tool(call)
+                    content = agent.conversation.messages[-1]["content"]
+                    if exception is None:
+                        self.assertEqual(content, evidence)
+                    else:
+                        self.assertIn("tool failed", content)
+                output.finish.assert_called_once_with()
+                output.activity.assert_not_called()
+
+    def test_standalone_interrupted_tool_stops_live_renderer_and_restores_cursor(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        stream = Terminal()
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
+        with patch.dict(os.environ, {"TERM": "xterm-256color", "TTY_INTERACTIVE": "1", "NO_COLOR": ""}), patch("terminal_output.shutil.get_terminal_size", return_value=os.terminal_size((80, 24))):
+            output = chat.TerminalOutput(stream)
+            agent = chat.PDFChatAgent(client=Mock(), output_factory=lambda: output)
+            agent.tools = {"lookup": Mock(side_effect=KeyboardInterrupt)}
+            with self.assertRaises(KeyboardInterrupt):
+                agent._execute_tool(call)
+        self.assertIsNone(output._live)
+        self.assertIsNone(output._activity)
+        screen = pyte.Screen(80, 24)
+        pyte.Stream(screen).feed(stream.getvalue().replace("\n", "\r\n"))
+        self.assertFalse(screen.cursor.hidden)
+
+    def test_stream_closes_even_when_display_finish_fails(self):
+        output = self.renderer_mock()
+        output.finish.side_effect = RuntimeError("display failed")
+
+        class CompletedStream:
+            close = Mock()
+
+            def __iter__(self):
+                yield ChatResponse(message=Message(role="assistant", content="Answer."), done=True)
+
+        stream = CompletedStream()
+        client = Mock(chat=Mock(return_value=stream))
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client):
+            with self.assertRaisesRegex(RuntimeError, "display failed"):
+                self.agent._stream_response(self.history)
+        stream.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

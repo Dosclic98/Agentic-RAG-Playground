@@ -111,7 +111,26 @@ aligned tables, and highlighted code. Completed blocks stay in scrollback, while
 the current block updates live. For a very long unfinished table or paragraph,
 the live view shows the latest lines; the complete block is printed when it finishes.
 The temporary thinking line remains grey and is erased when an answer or another
-message is printed. Tool calls appear as brief progress messages by default.
+message is printed.
+
+At startup, a compact panel shows the model, configured context window, shortened
+project path, and web-access badge. Green user prompts and cyan assistant separators
+make conversation turns easier to scan. One transient activity line shows the
+current model or tool operation and elapsed time, including while a PDF tool is
+busy. `/verbose` retains the detailed tool-call log. After each turn, a subdued
+footer shows elapsed time and tool-call count; generated tokens appear only when
+Ollama returned counts for all completed model rounds. The footer labels this sum
+as the **turn total**: it includes earlier generations that requested tools and
+the final model call. The verbose `Final model call` line reports only that last
+generation. These are generated-token counts, including thinking, rather than
+input/context-token counts.
+
+Interactive input supports Tab completion for commands and Up/Down question
+history through Python's optional `readline` module. End a line with a single
+backslash (`\`) and press Enter to continue a multiline question; submit it by
+ending the final line without a backslash. With GNU readline, bracketed multiline
+pastes remain one editable question until Enter. Input history holds up to 100
+entries in memory for the current session and is never written to a history file.
 
 PDF citations display as `[1]`, `[2]`, etc., with full paths and page numbers in a
 source list under each response. The model's saved conversation retains its full
@@ -185,7 +204,8 @@ The code is organized by responsibility:
 | `WebTools` | `code/tools/web_tools.py` | Optional public web search, page extraction, and an in-memory page cache. |
 | `CollectionIndex` | `code/tools/collection_index.py` | Persistent keyword index and recognized page text. |
 | `Calculator` | `code/tools/calculator.py` | Restricted arithmetic with decimal precision. |
-| `TerminalOutput` | `code/terminal_output.py` | Streamed answers and transient thinking display. |
+| `TerminalOutput` | `code/terminal_output.py` | Startup panel, streamed answers, transient thinking/activity, and turn statistics. |
+| `TerminalInput` | `code/terminal_input.py` | Command completion, private session history, and multiline input. |
 | `CitationFormatter` | `code/citations.py` | Compact PDF and web references with complete source details. |
 
 Edit the defaults in `code/config.py` to change model settings. The default model

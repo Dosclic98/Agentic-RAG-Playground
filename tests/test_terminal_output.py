@@ -2,6 +2,8 @@ import io
 import itertools
 import os
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -216,6 +218,182 @@ class TerminalOutputTests(unittest.TestCase):
         self.assertIn("Document [1]. External [2].", rendered)
         self.assertIn("[1] data/pdfs/report.pdf, p. 12", rendered)
         self.assertIn("[2] Web: https://example.com/report", rendered)
+
+    def test_startup_panel_shortens_home_path_and_fits_a_narrow_terminal(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        with patch("terminal_output.shutil.get_terminal_size", return_value=os.terminal_size((42, 24))):
+            output.startup("qwen3.8:27b-q8_0", 131072, Path.home() / "Agentic-RAG-Playground", False)
+        rendered, screen = self.screen_text(stream.getvalue(), columns=42)
+        self.assertIn("Agentic PDF RAG", rendered)
+        self.assertIn("qwen3.8:27b-q8_0", rendered)
+        self.assertIn("131,072 tokens", rendered)
+        self.assertIn("~/Agentic-RAG-Playground", rendered)
+        self.assertIn("OFF", rendered)
+        self.assertNotIn(str(Path.home()), rendered)
+        self.assertFalse(screen.cursor.hidden)
+
+    def test_redirected_startup_and_tool_activity_stay_plain(self):
+        stream = io.StringIO()
+        output = TerminalOutput(stream)
+        output.startup("local-model", 131072, "/tmp/project", True)
+        output.begin_turn()
+        output.activity("Waiting for the model…")
+        output.tool("search_pdf", {"path": "data/pdfs/report.pdf"})
+        output.answer("**Answer**")
+        output.end_turn(generated_tokens=25)
+        rendered = stream.getvalue()
+        self.assertIn("Web access: on (Tavily)", rendered)
+        self.assertIn("Searching report.pdf", rendered)
+        self.assertIn("Assistant: **Answer**", rendered)
+        self.assertNotIn("\033", rendered)
+        self.assertNotIn("Waiting for", rendered)
+        self.assertIsNone(output._live)
+
+    def test_tool_activity_is_replaced_and_never_left_in_scrollback(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        output.begin_turn()
+        output.tool("search_pdf", {"path": "data/pdfs/first.pdf"})
+        output.tool("read_pdf_content", {"path": "data/pdfs/second.pdf", "page": 4})
+        _, live_screen = self.screen_text(stream.getvalue())
+        self.assertIn("Reading second.pdf, page 4", "\n".join(live_screen.display))
+        self.assertNotIn("Searching first.pdf", "\n".join(live_screen.display))
+        output.answer("The answer.")
+        output.end_turn(generated_tokens=40)
+        rendered, screen = self.screen_text(stream.getvalue())
+        self.assertEqual(rendered.count("The answer."), 1)
+        self.assertIn("2 tool calls", rendered)
+        self.assertIn("40 generated tokens (turn total)", rendered)
+        self.assertNotIn("Searching first.pdf", rendered)
+        self.assertNotIn("Reading second.pdf", rendered)
+        self.assertNotIn("Generating the answer", rendered)
+        self.assertFalse(screen.cursor.hidden)
+        self.assertIsNone(output._live)
+        finished = stream.getvalue()
+        output.end_turn(generated_tokens=40)
+        self.assertEqual(stream.getvalue(), finished)
+
+    def test_activity_footer_stays_visible_below_large_table_and_thinking(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        output.begin_turn()
+        output.activity("Waiting for the model…")
+        table = "| Item | Value |\n| --- | ---: |\n"
+        table += "".join(f"| item{index:03d} | {index} |\n" for index in range(70))
+        output.answer(table)
+        output.thinking("Checking the figures")
+        _, live_screen = self.screen_text(stream.getvalue())
+        visible = "\n".join(live_screen.display)
+        self.assertIn("item069", visible)
+        self.assertIn("Checking the figures", visible)
+        self.assertIn("Thinking…", visible)
+        output.end_turn()
+        rendered, screen = self.screen_text(stream.getvalue())
+        for index in range(70):
+            self.assertEqual(rendered.count(f"item{index:03d}"), 1)
+        self.assertNotIn("Checking the figures", rendered)
+        self.assertFalse(screen.cursor.hidden)
+
+    def test_model_transport_failure_erases_activity_and_restores_cursor(self):
+        stream = FakeTerminal()
+        agent = PDFChatAgent(client=Mock(chat=Mock(side_effect=RuntimeError("unavailable"))),
+                             output_factory=lambda: TerminalOutput(stream))
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            agent.answer()
+        rendered, screen = self.screen_text(stream.getvalue())
+        self.assertNotIn("Waiting for the model", rendered)
+        self.assertFalse(screen.cursor.hidden)
+        self.assertIsNone(agent._get_output()._live)
+
+    def test_fast_chunks_publish_latest_answer_before_stream_pauses(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        with patch("terminal_output.time.monotonic", return_value=10.0):
+            output.activity("Waiting for the model…")
+            output.answer("First chunk")
+            output.answer(" and the newest chunk.")
+            output._live.refresh()
+            _, live_screen = self.screen_text(stream.getvalue())
+            visible = "\n".join(live_screen.display)
+            self.assertIn("First chunk and the newest chunk.", visible)
+            self.assertIn("Generating the answer", visible)
+        output.finish()
+
+    def test_speculative_live_citation_is_not_committed_after_code_closes(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        output.activity("Waiting for the model…")
+        output.answer("`Example [data/pdfs/report.pdf, p. 12]")
+        output.answer("` is code.")
+        output.finish()
+        rendered, _ = self.screen_text(stream.getvalue())
+        self.assertIn("data/pdfs/report.pdf, p. 12", rendered)
+        self.assertNotIn("Sources", rendered)
+
+    def test_very_short_terminals_preserve_answers_without_transient_lines(self):
+        for height in (1, 2):
+            with self.subTest(height=height), patch(
+                    "terminal_output.shutil.get_terminal_size", return_value=os.terminal_size((35, height))):
+                stream = FakeTerminal()
+                output = TerminalOutput(stream)
+                output.activity("Waiting for the model…")
+                output.answer("First unique paragraph.\n\n")
+                output.thinking("Ephemeral thought")
+                output.answer("Second unique paragraph.\n\n")
+                output.answer("Third unique paragraph.")
+                output.finish()
+                rendered, screen = self.screen_text(stream.getvalue(), columns=35, lines=height)
+                for label in ("First", "Second", "Third"):
+                    self.assertEqual(rendered.count(f"{label} unique paragraph."), 1)
+                self.assertNotIn("Waiting for the model", rendered)
+                self.assertNotIn("Ephemeral thought", rendered)
+                self.assertFalse(screen.cursor.hidden)
+
+    def test_blocking_tool_keeps_animating_and_interrupt_restores_cursor(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        entered, release = threading.Event(), threading.Event()
+
+        def blocking_tool():
+            entered.set()
+            release.wait(2)
+            raise KeyboardInterrupt
+
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="blocking_tool", arguments={}))
+        client = Mock(chat=Mock(return_value=iter([ChatResponse(
+            message=Message(role="assistant", tool_calls=[call]), done=True)])))
+        agent = PDFChatAgent(client=client, output_factory=lambda: output)
+        agent.tools["blocking_tool"] = blocking_tool
+        interrupted = []
+
+        def run():
+            try:
+                agent.answer()
+            except KeyboardInterrupt:
+                interrupted.append(True)
+
+        # Use a real clock for the only test that exercises the refresh thread.
+        with patch("terminal_output.time.monotonic", time.perf_counter):
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                before = len(stream.getvalue())
+                deadline = time.perf_counter() + 1
+                while len(stream.getvalue()) <= before and time.perf_counter() < deadline:
+                    release.wait(0.02)
+                self.assertGreater(len(stream.getvalue()), before)
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(interrupted, [True])
+        rendered, screen = self.screen_text(stream.getvalue())
+        self.assertNotIn("Running blocking tool", rendered)
+        self.assertNotIn("Preparing the next response", rendered)
+        self.assertFalse(screen.cursor.hidden)
+        self.assertIsNone(output._live)
 
 
 if __name__ == "__main__":

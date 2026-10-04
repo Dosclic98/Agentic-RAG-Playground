@@ -53,18 +53,22 @@ class PDFChatAgent:
         content = []
         tool_calls = []
         last_chunk = None
-        stream = self.client.chat(
-            model=self.config.model,
-            messages=history,
-            tools=list(self.tools.values()),
-            stream=True,
-            think=True,
-            options={
-                "num_ctx": self.config.context_length,
-                "num_predict": self.config.max_output_tokens,
-            },
-        )
+        stream = None
         try:
+            activity = getattr(output, "activity", None)
+            if callable(activity):
+                activity("Waiting for the model…")
+            stream = self.client.chat(
+                model=self.config.model,
+                messages=history,
+                tools=list(self.tools.values()),
+                stream=True,
+                think=True,
+                options={
+                    "num_ctx": self.config.context_length,
+                    "num_predict": self.config.max_output_tokens,
+                },
+            )
             for chunk in stream:
                 last_chunk = chunk
                 if chunk.message.thinking:
@@ -77,10 +81,12 @@ class PDFChatAgent:
                     output.clear_thinking()
                     tool_calls.extend(chunk.message.tool_calls)
         finally:
-            output.finish()
-            close = getattr(stream, "close", None)
-            if close:
-                close()
+            try:
+                output.finish()
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
         if last_chunk is None:
             raise RuntimeError("Ollama returned an empty response stream.")
         if not last_chunk.done:
@@ -93,36 +99,54 @@ class PDFChatAgent:
     def answer(self):
         """Answer the current question, retrieving evidence until the model finishes."""
         # Continue tool use until an answer is returned or the user interrupts.
+        output = self._get_output()
+        begin_turn = getattr(output, "begin_turn", None)
+        end_turn = getattr(output, "end_turn", None)
         compatibility_mode = False
-        while True:
-            try:
-                response = self._request_response(compatibility_mode)
-            except ResponseError as error:
-                if (compatibility_mode or error.status_code != 500
-                        or "no user query found" not in error.error.lower()):
-                    raise
-                self._get_output().status("Retrying the response…")
-                self._get_output().debug("[Chat] Using a compact conversation for Ollama compatibility.")
-                compatibility_mode = True
-                response = self._request_response(True)
+        generated_tokens = 0
+        counts_available = True
+        completed = False
+        try:
+            if callable(begin_turn):
+                begin_turn()
+            while True:
+                try:
+                    response = self._request_response(compatibility_mode)
+                except ResponseError as error:
+                    if (compatibility_mode or error.status_code != 500
+                            or "no user query found" not in error.error.lower()):
+                        raise
+                    output.status("Retrying the response…")
+                    output.debug("[Chat] Using a compact conversation for Ollama compatibility.")
+                    compatibility_mode = True
+                    response = self._request_response(True)
 
-            message = response.message
-            self.conversation.messages.append(message)
-
-            if not message.tool_calls:
-                reason = getattr(response, "done_reason", None) or "unknown"
                 tokens = getattr(response, "eval_count", None)
-                self._get_output().debug(f"[Chat] Generation ended: {reason}; generated tokens: {tokens}.")
-                if reason == "length":
-                    self._get_output().warning("The response reached the generation limit and may be "
-                                               "incomplete. Ask the model to continue, or narrow the request.")
-                elif not message.content:
-                    self._get_output().warning("The model returned no answer and no tool calls. "
-                                               "Try reformulating the question.")
-                return
+                if type(tokens) is int and tokens >= 0:
+                    generated_tokens += tokens
+                else:
+                    counts_available = False
+                message = response.message
+                self.conversation.messages.append(message)
 
-            for call in message.tool_calls:
-                self._execute_tool(call)
+                if not message.tool_calls:
+                    reason = getattr(response, "done_reason", None) or "unknown"
+                    token_label = f"{tokens:,}" if type(tokens) is int and tokens >= 0 else "unavailable"
+                    output.debug(f"[Chat] Final model call ended: {reason}; generated tokens: {token_label}.")
+                    if reason == "length":
+                        output.warning("The response reached the generation limit and may be "
+                                       "incomplete. Ask the model to continue, or narrow the request.")
+                    elif not message.content:
+                        output.warning("The model returned no answer and no tool calls. "
+                                       "Try reformulating the question.")
+                    completed = True
+                    return
+
+                for call in message.tool_calls:
+                    self._execute_tool(call)
+        finally:
+            if callable(end_turn):
+                end_turn(generated_tokens=generated_tokens if completed and counts_available else None)
 
     def _request_response(self, compatibility_mode):
         history = (self.conversation.compatibility_messages() if compatibility_mode
@@ -133,26 +157,35 @@ class PDFChatAgent:
         """Dispatch one tool call and save its evidence or error in the conversation."""
         name = call.function.name
         arguments = call.function.arguments
-        self._get_output().tool(name, arguments)
+        output = self._get_output()
         try:
-            if name not in self.tools:
-                raise ValueError(f"Unknown tool: {name}")
-            result = self.tools[name](**arguments)
-        except Exception as error:
-            result = json.dumps({"error": str(error)})
-            self._get_output().error(f"{name}: {error}")
-        self.conversation.messages.append({
-            "role": "tool", "tool_name": name, "content": result,
-        })
+            output.tool(name, arguments)
+            try:
+                if name not in self.tools:
+                    raise ValueError(f"Unknown tool: {name}")
+                result = self.tools[name](**arguments)
+            except Exception as error:
+                result = json.dumps({"error": str(error)})
+                output.error(f"{name}: {error}")
+            self.conversation.messages.append({
+                "role": "tool", "tool_name": name, "content": result,
+            })
+        finally:
+            output.finish()
 
     def run(self):
         """Read terminal input and handle commands, failures, and interrupts."""
         output = self._get_output()
-        output.status(f"Model: {self.config.model}")
-        output.status(f"Context window: {self.config.context_length:,} tokens")
-        output.status(f"Project: {self.pdf_tools.root}")
-        output.status(f"Web access: {'on (Tavily)' if self.web_tools else 'off'}")
-        output.status("Commands: /exit to quit, /clear to reset, /verbose to toggle tool details.")
+        startup = getattr(output, "startup", None)
+        if callable(startup):
+            startup(self.config.model, self.config.context_length,
+                    self.pdf_tools.root, bool(self.web_tools))
+        else:
+            output.status(f"Model: {self.config.model}")
+            output.status(f"Context window: {self.config.context_length:,} tokens")
+            output.status(f"Project: {self.pdf_tools.root}")
+            output.status(f"Web access: {'on (Tavily)' if self.web_tools else 'off'}")
+            output.status("Commands: /exit to quit, /clear to reset, /verbose to toggle tool details.")
 
         while True:
             try:

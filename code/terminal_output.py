@@ -5,36 +5,88 @@ import shutil
 import sys
 import time
 import unicodedata
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from markdown_it import MarkdownIt
-from rich.console import Console, Group
+from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.segment import Segment
+from rich.spinner import Spinner
+from rich.table import Table
 from rich.text import Text
 
 if __package__:
     from .citations import CitationFormatter
+    from .terminal_input import TerminalInput
 else:
     from citations import CitationFormatter
+    from terminal_input import TerminalInput
 
 
 class _TailView:
     """Keep the newest lines visible when an unfinished block exceeds the screen."""
 
-    def __init__(self, renderable):
+    def __init__(self, renderable, footer=()):
         self.renderable = renderable
+        self.footer = footer
 
     def __rich_console__(self, console, options):
-        lines = console.render_lines(self.renderable, options, pad=False)
-        height = max(2, console.size.height - 4)
-        if len(lines) > height:
-            yield Text("… showing latest lines", style="grey58")
-            lines = lines[-(height - 1):]
-        for line in lines:
+        lines = console.render_lines(self.renderable, options, pad=False) if self.renderable else []
+        height = max(1, console.size.height - 4)
+        footer_lines = [line for item in self.footer
+                        for line in console.render_lines(item, options, pad=False)]
+        available = max(0, height - len(footer_lines))
+        displayed = []
+        if len(lines) > available:
+            if available > 1:
+                displayed += console.render_lines(Text("… showing latest lines", style="grey58"),
+                                                  options, pad=False)
+                available -= 1
+            lines = lines[-available:] if available else []
+        displayed += lines + footer_lines[-height:]
+        for index, line in enumerate(displayed):
             yield from line
-            yield Segment.line()
+            if index < len(displayed) - 1:
+                yield Segment.line()
+
+
+class _ActivityLine:
+    """Animate a bounded status line, including while the caller is blocked."""
+
+    def __init__(self, label, started):
+        self.label = label
+        self.started = started
+        self.spinner = Spinner("dots", style="cyan")
+
+    def __rich_console__(self, console, options):
+        frame = self.spinner.render(console.get_time())
+        elapsed = max(0.0, time.monotonic() - self.started)
+        timer = Text(f" · {elapsed:.1f}s", style="grey50")
+        label = Text(self.label, style="grey63")
+        label.truncate(max(0, options.max_width - frame.cell_len - timer.cell_len - 1),
+                       overflow="ellipsis")
+        line = Text.assemble(frame, " ", label, timer)
+        line.no_wrap = True
+        line.overflow = "ellipsis"
+        yield line
+
+
+class _MarkdownPreview:
+    """Parse only the latest published snapshot, with provisional citations."""
+
+    def __init__(self, text, sources):
+        self.text = text
+        self.sources = dict(sources)
+        self._rendered = None
+
+    def __rich_console__(self, console, options):
+        if self._rendered is None:
+            formatter = CitationFormatter()
+            formatter.sources.update(self.sources)
+            self._rendered = Markdown(formatter.format(self.text), justify="left", hyperlinks=False)
+        yield self._rendered
 
 
 class TerminalOutput:
@@ -55,6 +107,10 @@ class TerminalOutput:
         self._pending = ""
         self._live = None
         self._last_refresh = 0.0
+        self._activity = None
+        self._turn_started = None
+        self._tool_count = 0
+        self._input = TerminalInput()
         self._parser = MarkdownIt().enable("table")
         self._citations = CitationFormatter()
 
@@ -67,9 +123,14 @@ class TerminalOutput:
         return Markdown(self._citations.format(text), justify="left", hyperlinks=False)
 
     def _start_live(self):
+        animated = self._activity is not None
+        if self._live is not None and self._live.auto_refresh != animated:
+            # Rich starts/stops its refresh thread with the Live instance.
+            self._stop_live()
         if self._live is None:
             self._live = Live(
-                Text(""), console=self.console, auto_refresh=False,
+                Text(""), console=self.console, auto_refresh=animated,
+                refresh_per_second=8,
                 transient=True, vertical_overflow="crop",
                 redirect_stdout=False, redirect_stderr=False,
             )
@@ -80,14 +141,23 @@ class TerminalOutput:
             live, self._live = self._live, None
             live.stop()
 
-    def _update_live(self):
+    def _update_live(self, refresh=True):
         self._sync_size()
-        renderable = self._markdown(self._pending)
+        # Rich's final newline can scroll a transient line off a one-row screen.
+        if self.console.height < 2:
+            self._stop_live()
+            return
+        renderable = _MarkdownPreview(self._pending, self._citations.sources) if self._pending else None
+        footer = []
         if self.visible:
-            renderable = Group(renderable, Text(self._thinking_text(), style="grey50"))
+            footer.append(Text(self._thinking_text(), style="grey50", no_wrap=True,
+                               overflow="ellipsis"))
+        if self._activity is not None:
+            footer.append(self._activity)
         self._start_live()
-        self._live.update(_TailView(renderable), refresh=True)
-        self._last_refresh = time.monotonic()
+        self._live.update(_TailView(renderable, footer), refresh=refresh)
+        if refresh:
+            self._last_refresh = time.monotonic()
 
     def _commit_completed(self):
         # Hold the last top-level Markdown block until a following block starts:
@@ -129,6 +199,7 @@ class TerminalOutput:
     def thinking(self, text):
         if not self.interactive:
             return
+        self._phase("Thinking…")
         parts = text.replace("\r", "\n").split("\n")
         for index, part in enumerate(parts):
             if index:
@@ -145,6 +216,7 @@ class TerminalOutput:
 
     def answer(self, text):
         self.clear_thinking()
+        self._phase("Generating the answer…")
         if not self._formatted:
             if not self.answer_started:
                 self.stream.write("\nAssistant: ")
@@ -153,17 +225,28 @@ class TerminalOutput:
             self.stream.flush()
             return
         if not self.answer_started:
+            self._stop_live()
             self._sync_size()
-            self.console.print(Text("\nAssistant:", style="bold cyan"))
+            self.console.print()
+            self.console.rule(Text("Assistant:", style="bold cyan"),
+                              align="left", style="grey35")
             self.answer_started = True
         self._pending += text
         # Repaint at most ten times per second rather than for every token.
-        if self._live is None or time.monotonic() - self._last_refresh >= 0.1:
+        refresh = self._live is None or time.monotonic() - self._last_refresh >= 0.1
+        if refresh:
             self._commit_completed()
-            self._update_live()
+        # Publish every chunk; the refresh thread can show it during a pause.
+        # Markdown parsing is deferred until the snapshot is actually rendered.
+        self._update_live(refresh=refresh)
 
     def finish(self):
-        self.clear_thinking()
+        if self._live is None:
+            self.clear_thinking()
+        else:
+            self.visible = False
+            self.thinking_line = ""
+        self._activity = None
         self._stop_live()
         if self.answer_started:
             if self._formatted:
@@ -184,17 +267,17 @@ class TerminalOutput:
         self._citations = CitationFormatter()
 
     def status(self, text, soft_wrap=False):
-        self.clear_thinking()
+        self.finish()
         self._sync_size()
         self.console.print(Text(text, style="grey58"), soft_wrap=soft_wrap)
 
     def warning(self, text):
-        self.clear_thinking()
+        self.finish()
         self._sync_size()
         self.console.print(Text("Warning: " + text, style="yellow"))
 
     def error(self, text):
-        self.clear_thinking()
+        self.finish()
         self._sync_size()
         self.console.print(Text("Error: " + text, style="red"))
 
@@ -207,15 +290,86 @@ class TerminalOutput:
         self.status(f"Verbose output {'on' if self.verbose else 'off'}.")
 
     def prompt(self):
-        if self.interactive:
-            self.console.print(Text("\nYou: ", style="bold green"), end="")
+        self.finish()
+        if self._formatted:
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                self.console.print()
+                if self.console.no_color:
+                    return self._input.read("You › ")
+                # Readline needs the prompt width to position/wrap editable text.
+                return self._input.read(
+                    "\001\033[1;32m\002You › \001\033[0m\002",
+                    continuation_prompt="\001\033[38;5;244m\002… \001\033[0m\002")
+            self.console.print(Text("\nYou › ", style="bold green"), end="")
             return input()
         return input("\nYou: ")
 
+    def startup(self, model, context_length, project_root, web_enabled):
+        """Show concise settings without changing the plain-output fallback."""
+        if not self._formatted:
+            for line in (f"Model: {model}", f"Context window: {context_length:,} tokens",
+                         f"Project: {project_root}",
+                         f"Web access: {'on (Tavily)' if web_enabled else 'off'}",
+                         "Commands: /exit to quit, /clear to reset, /verbose to toggle tool details."):
+                self.status(line)
+            return
+        self.finish()
+        self._sync_size()
+        project = Path(project_root)
+        try:
+            project_label = "~/" + str(project.relative_to(Path.home()))
+        except ValueError:
+            project_label = str(project)
+        settings = Table.grid(padding=(0, 2))
+        settings.add_column(style="grey63", no_wrap=True)
+        settings.add_column(overflow="fold")
+        settings.add_row("Model", Text(str(model)))
+        settings.add_row("Context", Text(f"{context_length:,} tokens"))
+        settings.add_row("Project", Text(project_label, style="grey63"))
+        settings.add_row("Web", Text("ON · Tavily" if web_enabled else "OFF",
+                                     style="green" if web_enabled else "grey58"))
+        self.console.print(Panel(settings, title=Text("Agentic PDF RAG", style="bold cyan"),
+                                 title_align="left", border_style="grey35", padding=(0, 1)))
+        self.console.print(Text(" /exit  quit   /clear  reset   /verbose  tool details", style="grey58"))
+        self.console.print(Text(" Tab  commands   ↑/↓  history   \\ + Enter  multiline", style="grey50"))
+
+    def begin_turn(self):
+        self.finish()
+        self._turn_started = time.monotonic()
+        self._tool_count = 0
+
+    def end_turn(self, generated_tokens=None):
+        self.finish()
+        if self._turn_started is None:
+            return
+        elapsed = max(0.0, time.monotonic() - self._turn_started)
+        self._turn_started = None
+        if self._formatted:
+            details = [f"{elapsed:.1f}s", f"{self._tool_count} tool call{'s' if self._tool_count != 1 else ''}"]
+            if generated_tokens is not None:
+                details.append(f"{generated_tokens:,} generated tokens (turn total)")
+            self._sync_size()
+            self.console.print(Text(" · ".join(details), style="grey50"))
+
+    def _phase(self, label):
+        if self._activity is not None and self._activity.label != label:
+            self._activity = _ActivityLine(label, self._activity.started)
+
+    def activity(self, text):
+        if not self._formatted:
+            return
+        self.clear_thinking()
+        # Labels are a single plain-text line, even for unusual filenames.
+        label = " ".join("".join(c for c in str(text) if c.isprintable() or c.isspace()).split())
+        if self._activity is None or self._activity.label != label:
+            self._activity = _ActivityLine(label, time.monotonic())
+        self._update_live()
+
     def tool(self, name, arguments):
+        if self._turn_started is not None:
+            self._tool_count += 1
         if self.verbose:
             self.status(f"[Tool] {name}({json.dumps(arguments, ensure_ascii=False)})", soft_wrap=True)
-            return
         filename = PurePosixPath(str(arguments.get("path", "PDF"))).name
         page = arguments.get("page", arguments.get("start_page", 1))
         end = arguments.get("end_page", page)
@@ -234,4 +388,8 @@ class TerminalOutput:
             "web_search": "Searching the web…",
             "read_web_page": "Reading a web page…",
         }
-        self.status(descriptions.get(name, f"Running {name.replace('_', ' ')}…"))
+        description = descriptions.get(name, f"Running {name.replace('_', ' ')}…")
+        if self._formatted:
+            self.activity(description)
+        elif not self.verbose:
+            self.status(description)
