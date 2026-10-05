@@ -116,14 +116,35 @@ message is printed.
 At startup, a compact panel shows the model, configured context window, shortened
 project path, and web-access badge. Green user prompts and cyan assistant separators
 make conversation turns easier to scan. One transient activity line shows the
-current model or tool operation and elapsed time, including while a PDF tool is
-busy. `/verbose` retains the detailed tool-call log. After each turn, a subdued
-footer shows elapsed time and tool-call count; generated tokens appear only when
-Ollama returned counts for all completed model rounds. The footer labels this sum
-as the **turn total**: it includes earlier generations that requested tools and
-the final model call. The verbose `Final model call` line reports only that last
-generation. These are generated-token counts, including thinking, rather than
-input/context-token counts.
+current model or tool operation. A live metrics line shows generated tokens,
+elapsed time, and recent tokens per second during thinking and answer generation.
+Live speed uses a rolling window of about one second starting with the first
+emitted text; startup waiting does not lower it. Speed appears as `— t/s` until
+enough samples arrive and during tool execution. Counts and live speed are
+prefixed with `~` while approximate:
+Ollama supplies exact usage in the final response chunk, as described in its
+[usage documentation](https://docs.ollama.com/api/usage). Live estimates use the
+cumulative thinking, answer, and emitted tool-call text at roughly four characters
+per token; stream chunks are not treated as individual tokens.
+
+Each completed model call replaces its estimate with Ollama's `eval_count` when
+available. The final **Turn total** footer retains the token count, elapsed time,
+Ollama's average generation speed, and tool-call count. Counts accumulate
+completed model calls and include partial output if generation is interrupted;
+abandoned attempts are
+excluded when retried. Missing usage or an
+interrupted generation retains the `~` marker. Tokens include thinking and model
+tool requests, and exclude the input/context tokens. Final `avg t/s` is calculated
+from Ollama's reported generation metrics across completed calls:
+`sum(eval_count) * 1e9 / sum(eval_duration)`. It excludes model loading, prompt
+processing, tool execution, and other waiting. Elapsed time still includes all
+of those stages. If any call lacks a valid count or a positive generation duration,
+the final average is shown as `— avg t/s`; an interrupted generation also leaves
+the average unavailable.
+
+`/verbose` retains the detailed tool-call log. Its `Final model call` line reports
+only the last generation, while the footer aggregates the turn. Live redraws and
+the metrics footer are omitted from redirected output.
 
 Interactive input supports Tab completion for commands and Up/Down question
 history through Python's optional `readline` module. End a line with a single
@@ -205,6 +226,7 @@ The code is organized by responsibility:
 | `CollectionIndex` | `code/tools/collection_index.py` | Persistent keyword index and recognized page text. |
 | `Calculator` | `code/tools/calculator.py` | Restricted arithmetic with decimal precision. |
 | `TerminalOutput` | `code/terminal_output.py` | Startup panel, streamed answers, transient thinking/activity, and turn statistics. |
+| `GenerationMetrics` | `code/generation_metrics.py` | Live token estimates, rolling speed, elapsed time, and reported generation averages. |
 | `TerminalInput` | `code/terminal_input.py` | Command completion, private session history, and multiline input. |
 | `CitationFormatter` | `code/citations.py` | Compact PDF and web references with complete source details. |
 

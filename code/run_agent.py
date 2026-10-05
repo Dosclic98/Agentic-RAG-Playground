@@ -55,6 +55,9 @@ class PDFChatAgent:
         last_chunk = None
         stream = None
         try:
+            begin_generation = getattr(output, "begin_generation", None)
+            if callable(begin_generation):
+                begin_generation()
             activity = getattr(output, "activity", None)
             if callable(activity):
                 activity("Waiting for the model…")
@@ -69,8 +72,11 @@ class PDFChatAgent:
                     "num_predict": self.config.max_output_tokens,
                 },
             )
+            generation_progress = getattr(output, "generation_progress", None)
             for chunk in stream:
                 last_chunk = chunk
+                if callable(generation_progress):
+                    generation_progress(chunk)
                 if chunk.message.thinking:
                     thinking.append(chunk.message.thinking)
                     output.thinking(chunk.message.thinking)
@@ -82,11 +88,16 @@ class PDFChatAgent:
                     tool_calls.extend(chunk.message.tool_calls)
         finally:
             try:
-                output.finish()
+                end_generation = getattr(output, "end_generation", None)
+                if callable(end_generation):
+                    end_generation()
             finally:
-                close = getattr(stream, "close", None)
-                if callable(close):
-                    close()
+                try:
+                    output.finish()
+                finally:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
         if last_chunk is None:
             raise RuntimeError("Ollama returned an empty response stream.")
         if not last_chunk.done:

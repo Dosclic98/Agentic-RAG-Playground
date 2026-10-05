@@ -338,12 +338,17 @@ class ChatTests(unittest.TestCase):
             raise ResponseError("no user query found in messages", 500)
             yield
         client = Mock()
+        output = self.renderer_mock()
+        recovered = ChatResponse(message=Message(role="assistant", content="Recovered."), done=True)
         client.chat.side_effect = [broken_stream(), iter([
-            ChatResponse(message=Message(role="assistant", content="Recovered."), done=True)])]
-        with patch.object(self.agent, "client", client), patch.object(self.agent.conversation, "messages", self.history), redirect_stdout(io.StringIO()):
+            recovered])]
+        with patch.object(self.agent, "client", client), patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent.conversation, "messages", self.history):
             self.agent.answer()
         self.assertEqual(client.chat.call_count, 2)
         self.assertEqual(self.history[-1].content, "Recovered.")
+        self.assertEqual(output.begin_generation.call_count, 2)
+        self.assertEqual(output.end_generation.call_count, 2)
+        output.generation_progress.assert_called_once_with(recovered)
 
     def test_tool_loop_continues_beyond_eight_rounds(self):
         call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
@@ -367,7 +372,8 @@ class ChatTests(unittest.TestCase):
         methods = ["status", "debug", "warning", "error", "tool", "thinking",
                    "answer", "clear_thinking", "finish", "prompt", "toggle_verbose"]
         if include_hooks:
-            methods += ["startup", "begin_turn", "activity", "end_turn"]
+            methods += ["startup", "begin_turn", "activity", "end_turn",
+                        "begin_generation", "generation_progress", "end_generation"]
         return Mock(spec=methods)
 
     def test_startup_hook_receives_settings_without_duplicate_status_lines(self):
@@ -404,6 +410,9 @@ class ChatTests(unittest.TestCase):
             self.agent.answer()
         output.begin_turn.assert_called_once_with()
         output.end_turn.assert_called_once_with(generated_tokens=42)
+        self.assertEqual(output.begin_generation.call_count, 2)
+        self.assertEqual(output.end_generation.call_count, 2)
+        self.assertEqual([entry.args[0] for entry in output.generation_progress.call_args_list], replies)
         output.debug.assert_called_once_with(
             "[Chat] Final model call ended: unknown; generated tokens: 30.")
         self.assertEqual([entry.args[0] for entry in output.activity.call_args_list],
@@ -436,6 +445,11 @@ class ChatTests(unittest.TestCase):
         output.finish.assert_called_once_with()
         output.begin_turn.assert_called_once_with()
         output.end_turn.assert_called_once_with(generated_tokens=None)
+        output.begin_generation.assert_called_once_with()
+        output.end_generation.assert_called_once_with()
+        output.generation_progress.assert_not_called()
+        self.assertEqual([entry[0] for entry in output.method_calls],
+                         ["begin_turn", "begin_generation", "activity", "end_generation", "finish", "end_turn"])
 
     def test_interrupted_later_stream_closes_resources_and_turn_without_partial_totals(self):
         output = self.renderer_mock()
@@ -458,6 +472,11 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(output.finish.call_count, 3)
         output.begin_turn.assert_called_once_with()
         output.end_turn.assert_called_once_with(generated_tokens=None)
+        self.assertEqual(output.begin_generation.call_count, 2)
+        self.assertEqual(output.end_generation.call_count, 2)
+        self.assertEqual(output.generation_progress.call_count, 2)
+        self.assertEqual([entry[0] for entry in output.method_calls[-3:]],
+                         ["end_generation", "finish", "end_turn"])
 
     def test_tool_completion_errors_and_interrupts_always_finish_activity(self):
         call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
@@ -515,6 +534,50 @@ class ChatTests(unittest.TestCase):
         with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client):
             with self.assertRaisesRegex(RuntimeError, "display failed"):
                 self.agent._stream_response(self.history)
+        stream.close.assert_called_once_with()
+
+    def test_generation_progress_precedes_display_and_forwards_final_counts(self):
+        output = self.renderer_mock()
+        call = Message.ToolCall(function=Message.ToolCall.Function(name="lookup", arguments={}))
+        chunks = [ChatResponse(message=Message(role="assistant", thinking="Find evidence.")),
+                  ChatResponse(message=Message(role="assistant", content="Found evidence.", tool_calls=[call])),
+                  ChatResponse(message=Message(role="assistant"), done=True, eval_count=30,
+                               prompt_eval_count=100, eval_duration=1000000)]
+        client = Mock(chat=Mock(return_value=iter(chunks)))
+        events = Mock()
+        events.attach_mock(output, "output")
+        events.attach_mock(client, "client")
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client):
+            response = self.agent._stream_response(self.history)
+        self.assertEqual([entry[0] for entry in events.method_calls],
+                         ["output.begin_generation", "output.activity", "client.chat",
+                          "output.generation_progress", "output.thinking",
+                          "output.generation_progress", "output.answer", "output.clear_thinking",
+                          "output.generation_progress", "output.end_generation", "output.finish"])
+        for observed, original in zip(output.generation_progress.call_args_list, chunks):
+            self.assertIs(observed.args[0], original)
+        self.assertEqual(response.message.thinking, "Find evidence.")
+        self.assertEqual(response.message.content, "Found evidence.")
+        self.assertEqual(response.message.tool_calls, [call])
+        self.assertEqual(response.eval_count, 30)
+
+    def test_generation_end_hook_failure_still_finishes_and_closes_stream(self):
+        output = self.renderer_mock()
+        output.end_generation.side_effect = RuntimeError("metrics failed")
+
+        class CompletedStream:
+            close = Mock()
+
+            def __iter__(self):
+                yield ChatResponse(message=Message(role="assistant", content="Answer."), done=True)
+
+        stream = CompletedStream()
+        client = Mock(chat=Mock(return_value=stream))
+        with patch.object(self.agent, "output_factory", return_value=output), patch.object(self.agent, "client", client):
+            with self.assertRaisesRegex(RuntimeError, "metrics failed"):
+                self.agent._stream_response(self.history)
+        output.end_generation.assert_called_once_with()
+        output.finish.assert_called_once_with()
         stream.close.assert_called_once_with()
 
 

@@ -264,7 +264,8 @@ class TerminalOutputTests(unittest.TestCase):
         rendered, screen = self.screen_text(stream.getvalue())
         self.assertEqual(rendered.count("The answer."), 1)
         self.assertIn("2 tool calls", rendered)
-        self.assertIn("40 generated tokens (turn total)", rendered)
+        self.assertIn("Turn total: 40 tokens", rendered)
+        self.assertIn("t/s", rendered)
         self.assertNotIn("Searching first.pdf", rendered)
         self.assertNotIn("Reading second.pdf", rendered)
         self.assertNotIn("Generating the answer", rendered)
@@ -305,6 +306,179 @@ class TerminalOutputTests(unittest.TestCase):
         self.assertNotIn("Waiting for the model", rendered)
         self.assertFalse(screen.cursor.hidden)
         self.assertIsNone(agent._get_output()._live)
+
+    def test_live_metrics_include_thinking_and_answer_then_reconcile_exact_count(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        now = [0.0]
+        with patch("terminal_output.time.monotonic", side_effect=lambda: now[0]):
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            now[0] = 1.0
+            thought = "t" * 300
+            output.generation_progress(ChatResponse(message=Message(role="assistant", thinking=thought)))
+            output.thinking(thought)
+            _, live_screen = self.screen_text(stream.getvalue())
+            visible = "\n".join(live_screen.display)
+            self.assertIn("~75 tokens · 1.0s · — t/s", visible)
+            now[0] = 2.0
+            answer = "a" * 100
+            output.generation_progress(ChatResponse(message=Message(role="assistant", content=answer)))
+            output.answer(answer)
+            _, live_screen = self.screen_text(stream.getvalue())
+            self.assertIn("~100 tokens · 2.0s · ~25.0 t/s", "\n".join(live_screen.display))
+            now[0] = 3.0
+            output.generation_progress(ChatResponse(message=Message(role="assistant"), done=True,
+                                                   eval_count=92, eval_duration=2000000000))
+            output.end_generation()
+            output.end_turn(generated_tokens=92)
+        rendered, screen = self.screen_text(stream.getvalue())
+        self.assertIn("Turn total: 92 tokens · 3.0s · 46.0 avg t/s", rendered)
+        self.assertNotIn("~92", rendered)
+        self.assertFalse(screen.cursor.hidden)
+
+    def test_metrics_span_model_rounds_and_continue_during_tools(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        now = [0.0]
+        with patch("terminal_output.time.monotonic", side_effect=lambda: now[0]):
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            now[0] = 1.0
+            output.generation_progress(ChatResponse(message=Message(role="assistant"), done=True,
+                                                   eval_count=6, eval_duration=1000000000))
+            output.end_generation()
+            output.finish()
+            output.tool("read_pdf_content", {"path": "data/pdfs/report.pdf", "page": 2})
+            _, live_screen = self.screen_text(stream.getvalue())
+            self.assertIn("6 tokens · 1.0s · — t/s", "\n".join(live_screen.display))
+            now[0] = 8.0
+            output._live.refresh()
+            _, live_screen = self.screen_text(stream.getvalue())
+            self.assertIn("6 tokens · 8.0s · — t/s", "\n".join(live_screen.display))
+            output.finish()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            output.generation_progress(ChatResponse(message=Message(role="assistant", content="Done.")))
+            output.answer("Done.")
+            now[0] = 10.0
+            output.generation_progress(ChatResponse(message=Message(role="assistant"), done=True,
+                                                   eval_count=3, eval_duration=250000000))
+            output.end_generation()
+            output.end_turn(generated_tokens=9)
+        rendered, _ = self.screen_text(stream.getvalue())
+        self.assertIn("Turn total: 9 tokens · 10.0s · 7.2 avg t/s", rendered)
+        self.assertIn("1 tool call", rendered)
+
+    def test_live_rate_excludes_startup_and_final_uses_server_generation_duration(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        now = [0.0]
+        with patch("terminal_output.time.monotonic", side_effect=lambda: now[0]):
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            now[0] = 100.0
+            output.generation_progress(ChatResponse(message=Message(role="assistant", thinking="a" * 400)))
+            output.thinking("Thinking after startup")
+            _, live_screen = self.screen_text(stream.getvalue())
+            self.assertIn("~100 tokens · 100.0s · — t/s", "\n".join(live_screen.display))
+            now[0] = 100.25
+            output.generation_progress(ChatResponse(message=Message(role="assistant", content="a" * 100)))
+            output.answer("The final answer.")
+            _, live_screen = self.screen_text(stream.getvalue())
+            self.assertIn("~125 tokens · 100.2s · ~100.0 t/s", "\n".join(live_screen.display))
+            now[0] = 101.0
+            output.generation_progress(ChatResponse(message=Message(role="assistant"), done=True,
+                                                   eval_count=125, eval_duration=1250000000))
+            output.end_generation()
+            output.end_turn(generated_tokens=125)
+        rendered, screen = self.screen_text(stream.getvalue())
+        self.assertIn("Turn total: 125 tokens · 101.0s · 100.0 avg t/s", rendered)
+        self.assertFalse(screen.cursor.hidden)
+
+    def test_exact_count_without_server_duration_does_not_invent_final_average(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        now = [0.0]
+        with patch("terminal_output.time.monotonic", side_effect=lambda: now[0]):
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            output.generation_progress(ChatResponse(message=Message(role="assistant", content="Done."),
+                                                   done=True, eval_count=50))
+            output.answer("Done.")
+            now[0] = 5.0
+            output.end_generation()
+            output.end_turn(generated_tokens=50)
+        rendered, _ = self.screen_text(stream.getvalue())
+        self.assertIn("Turn total: 50 tokens · 5.0s · — avg t/s", rendered)
+
+    def test_short_narrow_terminal_keeps_live_speed_visible(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        now = [0.0]
+        with patch("terminal_output.time.monotonic", side_effect=lambda: now[0]), patch(
+                "terminal_output.shutil.get_terminal_size", return_value=os.terminal_size((35, 2))):
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            now[0] = 10.0
+            output.generation_progress(ChatResponse(message=Message(role="assistant", thinking="a" * 2000)))
+            now[0] = 10.5
+            output.generation_progress(ChatResponse(message=Message(role="assistant", thinking="a" * 2000)))
+            output._live.refresh()
+            _, live_screen = self.screen_text(stream.getvalue(), columns=35, lines=2)
+            self.assertIn("~1,000 tok · 10.5s · ~1000.0 t/s", "\n".join(live_screen.display))
+            output.end_generation()
+            output.end_turn()
+        _, screen = self.screen_text(stream.getvalue(), columns=35, lines=2)
+        self.assertFalse(screen.cursor.hidden)
+
+    def test_missing_counts_keep_estimate_in_footer_and_new_turn_resets_metrics(self):
+        stream = FakeTerminal()
+        output = TerminalOutput(stream)
+        now = [0.0]
+        with patch("terminal_output.time.monotonic", side_effect=lambda: now[0]):
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            chunk = ChatResponse(message=Message(role="assistant", content="a" * 40), done=True)
+            output.generation_progress(chunk)
+            output.answer(chunk.message.content)
+            now[0] = 2.0
+            output.end_generation()
+            output.end_turn()
+            rendered, _ = self.screen_text(stream.getvalue())
+            self.assertIn("Turn total: ~10 tokens · 2.0s · — avg t/s", rendered)
+            now[0] = 4.0
+            output.begin_turn()
+            output.begin_generation()
+            output.activity("Waiting for the model…")
+            now[0] = 5.0
+            output._live.refresh()
+            _, live_screen = self.screen_text(stream.getvalue())
+            self.assertIn("~0 tokens · 1.0s · — t/s", "\n".join(live_screen.display))
+            output.end_generation()
+            output.end_turn()
+
+    def test_metrics_hooks_do_not_change_redirected_output(self):
+        stream = io.StringIO()
+        output = TerminalOutput(stream)
+        output.begin_turn()
+        output.begin_generation()
+        output.activity("Waiting for the model…")
+        thought = ChatResponse(message=Message(role="assistant", thinking="A private thought."))
+        output.generation_progress(thought)
+        output.thinking(thought.message.thinking)
+        answer = ChatResponse(message=Message(role="assistant", content="Answer."), done=True, eval_count=12)
+        output.generation_progress(answer)
+        output.answer(answer.message.content)
+        output.end_generation()
+        output.end_turn(generated_tokens=12)
+        self.assertEqual(stream.getvalue(), "\nAssistant: Answer.\n")
 
     def test_fast_chunks_publish_latest_answer_before_stream_pauses(self):
         stream = FakeTerminal()

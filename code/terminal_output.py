@@ -19,9 +19,11 @@ from rich.text import Text
 
 if __package__:
     from .citations import CitationFormatter
+    from .generation_metrics import GenerationMetrics
     from .terminal_input import TerminalInput
 else:
     from citations import CitationFormatter
+    from generation_metrics import GenerationMetrics
     from terminal_input import TerminalInput
 
 
@@ -55,15 +57,16 @@ class _TailView:
 class _ActivityLine:
     """Animate a bounded status line, including while the caller is blocked."""
 
-    def __init__(self, label, started):
+    def __init__(self, label, started, show_elapsed=True):
         self.label = label
         self.started = started
+        self.show_elapsed = show_elapsed
         self.spinner = Spinner("dots", style="cyan")
 
     def __rich_console__(self, console, options):
         frame = self.spinner.render(console.get_time())
-        elapsed = max(0.0, time.monotonic() - self.started)
-        timer = Text(f" · {elapsed:.1f}s", style="grey50")
+        elapsed = max(0.0, time.monotonic() - self.started) if self.show_elapsed else 0.0
+        timer = Text(f" · {elapsed:.1f}s" if self.show_elapsed else "", style="grey50")
         label = Text(self.label, style="grey63")
         label.truncate(max(0, options.max_width - frame.cell_len - timer.cell_len - 1),
                        overflow="ellipsis")
@@ -71,6 +74,30 @@ class _ActivityLine:
         line.no_wrap = True
         line.overflow = "ellipsis"
         yield line
+
+
+def _metrics_text(snapshot, compact=False, average=False):
+    prefix = "~" if snapshot.estimated else ""
+    unit = "tok" if compact else "tokens"
+    rate_unit = "avg t/s" if average else "t/s"
+    if snapshot.rate is None:
+        rate = f"— {rate_unit}"
+    else:
+        rate_prefix = "~" if snapshot.rate_estimated else ""
+        rate = f"{rate_prefix}{snapshot.rate:.1f} {rate_unit}"
+    return (f"{prefix}{snapshot.tokens:,} {unit} · {snapshot.elapsed:.1f}s · "
+            f"{rate}")
+
+
+class _MetricsLine:
+    """Read a consistent snapshot each refresh, including during tool waits."""
+
+    def __init__(self, metrics):
+        self.metrics = metrics
+
+    def __rich_console__(self, console, options):
+        yield Text(_metrics_text(self.metrics.snapshot(), compact=options.max_width < 50),
+                   style="grey50")
 
 
 class _MarkdownPreview:
@@ -110,6 +137,7 @@ class TerminalOutput:
         self._activity = None
         self._turn_started = None
         self._tool_count = 0
+        self._metrics = GenerationMetrics()
         self._input = TerminalInput()
         self._parser = MarkdownIt().enable("table")
         self._citations = CitationFormatter()
@@ -123,7 +151,7 @@ class TerminalOutput:
         return Markdown(self._citations.format(text), justify="left", hyperlinks=False)
 
     def _start_live(self):
-        animated = self._activity is not None
+        animated = self._activity is not None or self._turn_started is not None
         if self._live is not None and self._live.auto_refresh != animated:
             # Rich starts/stops its refresh thread with the Live instance.
             self._stop_live()
@@ -154,6 +182,8 @@ class TerminalOutput:
                                overflow="ellipsis"))
         if self._activity is not None:
             footer.append(self._activity)
+        if self._turn_started is not None:
+            footer.append(_MetricsLine(self._metrics))
         self._start_live()
         self._live.update(_TailView(renderable, footer), refresh=refresh)
         if refresh:
@@ -337,23 +367,36 @@ class TerminalOutput:
         self.finish()
         self._turn_started = time.monotonic()
         self._tool_count = 0
+        self._metrics.begin_turn(started=self._turn_started)
+
+    def begin_generation(self):
+        if self._turn_started is not None:
+            self._metrics.begin_generation()
+
+    def generation_progress(self, chunk):
+        if self._turn_started is not None:
+            self._metrics.progress(chunk)
+
+    def end_generation(self):
+        if self._turn_started is not None:
+            self._metrics.end_generation()
 
     def end_turn(self, generated_tokens=None):
         self.finish()
         if self._turn_started is None:
             return
-        elapsed = max(0.0, time.monotonic() - self._turn_started)
+        self._metrics.finish_turn(generated_tokens=generated_tokens)
+        snapshot = self._metrics.snapshot()
         self._turn_started = None
         if self._formatted:
-            details = [f"{elapsed:.1f}s", f"{self._tool_count} tool call{'s' if self._tool_count != 1 else ''}"]
-            if generated_tokens is not None:
-                details.append(f"{generated_tokens:,} generated tokens (turn total)")
+            details = ["Turn total: " + _metrics_text(snapshot, average=True),
+                       f"{self._tool_count} tool call{'s' if self._tool_count != 1 else ''}"]
             self._sync_size()
             self.console.print(Text(" · ".join(details), style="grey50"))
 
     def _phase(self, label):
         if self._activity is not None and self._activity.label != label:
-            self._activity = _ActivityLine(label, self._activity.started)
+            self._activity = _ActivityLine(label, self._activity.started, self._activity.show_elapsed)
 
     def activity(self, text):
         if not self._formatted:
@@ -362,7 +405,7 @@ class TerminalOutput:
         # Labels are a single plain-text line, even for unusual filenames.
         label = " ".join("".join(c for c in str(text) if c.isprintable() or c.isspace()).split())
         if self._activity is None or self._activity.label != label:
-            self._activity = _ActivityLine(label, time.monotonic())
+            self._activity = _ActivityLine(label, time.monotonic(), self._turn_started is None)
         self._update_live()
 
     def tool(self, name, arguments):
